@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import optimizer
-from typing import List, Optional
+from typing import List, Optional, Callable, Any
 import json
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
@@ -38,6 +38,15 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s: %(message)s',
     level=logging.INFO
 )
+
+
+def load_json(path: str, default: Any) -> Any:
+    """Load JSON data from *path* or return *default* on failure."""
+    try:
+        with open(path, 'r') as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.decoder.JSONDecodeError):
+        return copy.deepcopy(default)
 
 class SubscriptionRequest(BaseModel):
     ip: str
@@ -460,35 +469,22 @@ async def unsubscribe(request: Request):
     return {'message' : 'unsubscribe finish'}
 
 def compute_frequnecy(serviceType: str, agentCounter: int):
+    service_list = load_json(SERVICE_FILE, [])
+    must_auto_scaling = not any(s['serviceType'] == serviceType for s in service_list)
 
-    mustAutoScaling = True
+    def need_scaling(relations: List[dict]) -> bool:
+        return any(r['currentFrequency'] < r['frequencyLimit'][0] for r in relations)
 
-    with open(SERVICE_FILE, 'r') as service_jsonFile:
-        try:
-            service_list = json.load(service_jsonFile)
-        except json.decoder.JSONDecodeError:
-            service_list = []
-
-    for service in service_list:
-        if service['serviceType'] == serviceType:
-            mustAutoScaling = False
-
-    if not mustAutoScaling:
+    if not must_auto_scaling:
         status, relation_list = optimize(serviceType, agentCounter, service_list)
-        for relation in relation_list:
-            if relation['currentFrequency'] < relation['frequencyLimit'][0]:
-                mustAutoScaling = True
-                break
-    if mustAutoScaling:
+        if need_scaling(relation_list):
+            must_auto_scaling = True
+    if must_auto_scaling:
         deploy_service(serviceType)
-        with open(SERVICE_FILE, 'r') as service_jsonFile:
-            try:
-                service_list = json.load(service_jsonFile)
-            except json.decoder.JSONDecodeError:
-                service_list = []    
-        status, relation_list = optimize(serviceType, agentCounter, service_list)   
-        while status=='fail':
-            agentCounter -=1
+        service_list = load_json(SERVICE_FILE, [])
+        status, relation_list = optimize(serviceType, agentCounter, service_list)
+        while status == 'fail':
+            agentCounter -= 1
             status, relation_list = optimize(serviceType, agentCounter, service_list)
 
     return relation_list
@@ -852,48 +848,27 @@ def delete_pod(pod_name, namespace='default'):
             print(f"Failed to delete Pod: {e}")
 
 def node_status_sync(node_name_list: List[str]):
-    node_health_status = {}
+    def check(node_name: str) -> (str, str):
+        ip = get_node_ip(node_name)
+        if ip == "Error":
+            return node_name, "unhealthy"
+        try:
+            status = curl_health_check(ip)
+            health = "healthy" if status.strip().lower() == "ok" else "unhealthy"
+            return node_name, health
+        except Exception:
+            return node_name, "unhealthy"
 
-    # 使用 ThreadPoolExecutor 平行處理健康檢查
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        # 用於儲存未來結果的字典
-        future_to_node = {}
-        
-        for node_name in node_name_list:
-            # 呼叫 get_node_ip 取得節點 IP
-            ip = get_node_ip(node_name)
-            
-            if ip != "Error":
-                # 提交 curl_health_check 到執行緒池，並將 node_name 和 future 綁定
-                future = executor.submit(curl_health_check, ip)
-                future_to_node[future] = node_name
-            else:
-                # 如果未能取得 IP，視為 unhealthy
-                node_health_status[node_name] = "unhealthy"
+        results = dict(executor.map(check, node_name_list))
 
-        # 收集所有已完成的健康檢查
-        for future in concurrent.futures.as_completed(future_to_node):
-            node_name = future_to_node[future]
-            try:
-                # 獲取健康檢查結果
-                health_status = future.result()
-                
-                # 根據回傳值來決定健康狀態
-                if health_status.strip().lower() == 'ok':
-                    node_health_status[node_name] = "healthy"
-                else:
-                    node_health_status[node_name] = "unhealthy"
-                    
-            except Exception as e:
-                # 捕捉任何執行過程中的例外情況
-                node_health_status[node_name] = "unhealthy"
     try:
         with open(NODE_STATUS_FILE, 'w') as node_status_file:
-            json.dump(node_health_status, node_status_file, indent=4)
-    except Exception as e:
+            json.dump(results, node_status_file, indent=4)
+    except Exception:
         raise HTTPException(status_code=500, detail="Failed to write to node_status file")
-    # 將結果轉換為 JSON 格式並返回
-    return json.dumps(node_health_status, indent=4)
+
+    return json.dumps(results, indent=4)
 
 def is_pod_terminating(core_api, pod_name, namespace="default"):
     """
