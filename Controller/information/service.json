@@ -8,7 +8,7 @@
         "hostIP": "10.52.52.25",
         "frequencyLimit": [
             30,
-            15
+            20
         ],
         "currentFrequency": 30,
         "workloadLimit": 180
@@ -22,7 +22,7 @@
         "hostIP": "10.52.52.25",
         "frequencyLimit": [
             20,
-            10
+            15
         ],
         "currentFrequency": 20,
         "workloadLimit": 80
