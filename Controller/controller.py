@@ -653,8 +653,6 @@ def deploy_service(serviceType: str):
 
 def adjust_frequency(serviceType: str):
 
-    podIPIndex_dict = {}
-
     with open(SERVICE_FILE, 'r') as service_jsonFile:
         try:
             service_list = json.load(service_jsonFile)
@@ -667,50 +665,70 @@ def adjust_frequency(serviceType: str):
         except json.decoder.JSONDecodeError:
             subscription_list = []
 
-    for index, service in enumerate(service_list):
-        if service['serviceType'] == serviceType:
-            podIPIndex_dict[service['podIP']] = {}
-            podIPIndex_dict[service['podIP']]['index'] = index
-            podIPIndex_dict[service['podIP']]['currentConnection'] = service['currentConnection']
-            podIPIndex_dict[service['podIP']]['currentFrequency'] = service['currentFrequency']
-            podIPIndex_dict[service['podIP']]['nodeName'] = service['nodeName']
+    podIPIndex_dict = {
+        service['podIP']: {
+            'index': i,
+            'currentConnection': service['currentConnection'],
+            'currentFrequency': service['currentFrequency'],
+            'nodeName': service['nodeName'],
+        }
+        for i, service in enumerate(service_list)
+        if service['serviceType'] == serviceType
+    }
 
-    reconfigureAgentIndex_list = []
-
-    # 這個迴圈會先讓不用動的終端調整好頻率並收集需要移動的終端之index
-    for index, subscription in enumerate(subscription_list):
-        logging.debug(f"index {index} pod={subscription['podIP']} connection={podIPIndex_dict.get(subscription['podIP'], {}).get('currentConnection')}")
-        # 如果該終端原本訂閱的Pod還有名額
-        if subscription['podIP'] in podIPIndex_dict.keys() and podIPIndex_dict[subscription['podIP']]['currentConnection'] != 0 and subscription['serviceType'] == serviceType:
-            podIPIndex_dict[subscription['podIP']]['currentConnection'] -=1
+    
+    def handle_subscription(item):
+        idx, sub = item
+        logging.debug(
+            f"index {idx} pod={sub['podIP']} connection={podIPIndex_dict.get(sub['podIP'], {}).get('currentConnection')}"
+        )
+        if (
+            sub['serviceType'] == serviceType
+            and sub['podIP'] in podIPIndex_dict
+            and podIPIndex_dict[sub['podIP']]['currentConnection'] != 0
+        ):
+            podIPIndex_dict[sub['podIP']]['currentConnection'] -= 1
             body = {
                 'servicename': serviceType,
                 "ip": 'null',
                 "port": 0,
-                "frequency": service_list[podIPIndex_dict[subscription['podIP']]['index']]['currentFrequency']
+                "frequency": service_list[podIPIndex_dict[sub['podIP']]['index']]['currentFrequency'],
             }
-            communicate_with_agent(body,str(subscription['agentIP']), int(subscription['agentPort']))
+            communicate_with_agent(body, str(sub['agentIP']), int(sub['agentPort']))
+            return sub, False
+        elif sub['serviceType'] == serviceType:
+            if sub['podIP'] in podIPIndex_dict:
+                del podIPIndex_dict[sub['podIP']]
+            return sub, True
+        return sub, False
 
-        # 如果該終端原本訂閱的Pod沒有名額
-        elif subscription['serviceType'] == serviceType:
-            reconfigureAgentIndex_list.append(index)
-            if subscription['podIP'] in podIPIndex_dict.keys(): del podIPIndex_dict[subscription['podIP']]
+    handled = [handle_subscription(item) for item in enumerate(subscription_list)]
+    subscription_list = [h[0] for h in handled]
+    reconfigureAgentIndex_list = [i for i, h in enumerate(handled) if h[1]]
 
-    for reconfigureAgentIndex in reconfigureAgentIndex_list:
+    def reconfigure(idx):
+        sub = subscription_list[idx]
         for key, value in podIPIndex_dict.items():
             if int(value['currentConnection']) != 0:
-                value['currentConnection'] -=1
+                value['currentConnection'] -= 1
                 body = {
-                'servicename': serviceType,
-                "ip": str(service_list[value['index']]['hostIP']),
-                "port": int(service_list[value['index']]['hostPort']),
-                "frequency": service_list[value['index']]['currentFrequency']
+                    'servicename': serviceType,
+                    "ip": str(service_list[value['index']]['hostIP']),
+                    "port": int(service_list[value['index']]['hostPort']),
+                    "frequency": service_list[value['index']]['currentFrequency'],
                 }
-                communicate_with_agent(body,str(subscription_list[reconfigureAgentIndex]['agentIP']), int(subscription_list[reconfigureAgentIndex]['agentPort']))
-                subscription_list[reconfigureAgentIndex]['podIP'] = str(key)
-                subscription_list[reconfigureAgentIndex]['nodeName'] = str(service_list[value['index']]['nodeName'])
-                break
-    
+                communicate_with_agent(body, str(sub['agentIP']), int(sub['agentPort']))
+                return {
+                    **sub,
+                    'podIP': str(key),
+                    'nodeName': str(service_list[value['index']]['nodeName']),
+                }
+        return sub
+
+    subscription_list = [
+        reconfigure(i) if i in reconfigureAgentIndex_list else sub
+        for i, sub in enumerate(subscription_list)
+    ]
     # 更新subscription.json的內容
     with open(SUBSCRIPTION_FILE, 'w') as subscription_jsonFile:
         json.dump(subscription_list, subscription_jsonFile, indent=4)

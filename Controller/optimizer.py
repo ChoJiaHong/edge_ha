@@ -22,80 +22,87 @@ def optimize(servicetype: str, agentcount: int, servicelist: list) -> tuple[str,
     status = "success"
     hasdistributed = 0      # number of agent that has been distributed
 
-    # 儲存原始順序
-    for i, instance in enumerate(servicelist):
-        instance["originalIndex"] = i
+    # 儲存原始順序並初始化所需欄位
+    servicelist = [
+        {
+            **instance,
+            "originalIndex": i,
+            "currentConnection": 0 if instance["serviceType"] == servicetype else instance["currentConnection"],
+        }
+        for i, instance in enumerate(servicelist)
+    ]
 
-    for instance in servicelist:
-        # clear all the current connection to redistribute
-        if instance["serviceType"] == servicetype:
-            instance["currentConnection"] = 0
-        # add a field called remainWorkload
-        instance["remainWorkload"] = instance["workloadLimit"] - instance["currentConnection"] * instance["frequencyLimit"][0]
-        # add a field called predFreq
-        # represent the freq when a new agent is added
-        instance["predFreq"] = instance["workloadLimit"] / (instance["currentConnection"] + 1)
-    # sort by remainWorkload descending
+    servicelist = [
+        {
+            **instance,
+            "remainWorkload": instance["workloadLimit"] - instance["currentConnection"] * instance["frequencyLimit"][0],
+            "predFreq": instance["workloadLimit"] / (instance["currentConnection"] + 1),
+        }
+        for instance in servicelist
+    ]
+
     servicelist = sorted(servicelist, key=lambda x: x["remainWorkload"], reverse=True)
 
-    idx = 0
-    while hasdistributed < agentcount and idx < len(servicelist):
-        if servicelist[idx]["serviceType"] == servicetype:
-            if servicelist[idx]["remainWorkload"] >= servicelist[idx]["frequencyLimit"][0]:
-                # can distribute as default transmission rate
-                servicelist[idx]["currentConnection"] += 1
-                servicelist[idx]["remainWorkload"] -= servicelist[idx]["frequencyLimit"][0]
-                servicelist[idx]["currentFrequency"] = servicelist[idx]["frequencyLimit"][0]
-                servicelist[idx]["predFreq"] = servicelist[idx]["workloadLimit"] / (servicelist[idx]["currentConnection"] + 1)
-                hasdistributed += 1
-                servicelist = sorted(servicelist, key=lambda x: x["remainWorkload"], reverse=True)
-                idx = 0
-            else:
-                break
-        else:
-            # wrong service type, skip
-            idx += 1
-            continue
+    while hasdistributed < agentcount:
+        candidates = [
+            (i, s) for i, s in enumerate(servicelist)
+            if s["serviceType"] == servicetype and s["remainWorkload"] >= s["frequencyLimit"][0]
+        ]
+        if not candidates:
+            break
+        idx, best = max(candidates, key=lambda x: x[1]["remainWorkload"])
+        new_conn = best["currentConnection"] + 1
+        updated = {
+            **best,
+            "currentConnection": new_conn,
+            "remainWorkload": best["remainWorkload"] - best["frequencyLimit"][0],
+            "currentFrequency": best["frequencyLimit"][0],
+            "predFreq": best["workloadLimit"] / (new_conn + 1),
+        }
+        servicelist = [updated if i == idx else s for i, s in enumerate(servicelist)]
+        hasdistributed += 1
     # if no agent is distributed, there is no instance of the service type
     if hasdistributed == 0:
-        for instance in servicelist:
-            del instance["remainWorkload"]
-            del instance["predFreq"]
-            del instance["originalIndex"]
-            status = "fail"
+        servicelist = [
+            {k: v for k, v in instance.items() if k not in ("remainWorkload", "predFreq", "originalIndex")}
+            for instance in servicelist
+        ]
+        status = "fail"
         return status, servicelist
 
     # all instance is full, cannot add a agent with default transmission rate
-    idx = 0
-    while hasdistributed < agentcount and idx < len(servicelist):
-        servicelist = sorted(servicelist, key=lambda x: x["predFreq"], reverse=True)
-        if servicelist[idx]["serviceType"] == servicetype:
-            # let agent join the instance which has the most predFreq
-            servicelist[idx]["currentConnection"] += 1
-            servicelist[idx]["currentFrequency"] = servicelist[idx]["workloadLimit"] / servicelist[idx]["currentConnection"]
-            servicelist[idx]["remainWorkload"] = 0
+    while hasdistributed < agentcount:
+        candidates = [
+            (i, s) for i, s in enumerate(servicelist) if s["serviceType"] == servicetype
+        ]
+        if not candidates:
+            break
+        idx, best = max(candidates, key=lambda x: x[1]["predFreq"])
+        new_conn = best["currentConnection"] + 1
+        new_freq = best["workloadLimit"] / new_conn
+        if new_freq < best["frequencyLimit"][1]:
+            status = "fail"
+        updated = {
+            **best,
+            "currentConnection": new_conn,
+            "currentFrequency": new_freq,
+            "remainWorkload": 0,
+            "predFreq": best["workloadLimit"] / (new_conn + 1),
+        }
+        servicelist = [updated if i == idx else s for i, s in enumerate(servicelist)]
+        hasdistributed += 1
 
-            # the freqency is under minimum FPS fli
-            if servicelist[idx]["currentFrequency"] < servicelist[idx]["frequencyLimit"][1]:
-                status = "fail"
-
-            servicelist[idx]["predFreq"] = servicelist[idx]["workloadLimit"] / (servicelist[idx]["currentConnection"] + 1)
-            hasdistributed += 1
-            servicelist = sorted(servicelist, key=lambda x: x["predFreq"], reverse=True)
-            idx = 0
-        else:
-            # wrong service type, skip
-            idx += 1
-            continue
-
-    for instance in servicelist:
-        del instance["remainWorkload"]
-        del instance["predFreq"]
+    servicelist = [
+        {k: v for k, v in s.items() if k not in ("remainWorkload", "predFreq")}
+        for s in servicelist
+    ]
 
     # 恢復原本順序並移除標記欄位
     servicelist = sorted(servicelist, key=lambda x: x["originalIndex"])
-    for instance in servicelist:
-        del instance["originalIndex"]
+    servicelist = [
+        {k: v for k, v in s.items() if k != "originalIndex"}
+        for s in servicelist
+    ]
         
     return status, servicelist
 
